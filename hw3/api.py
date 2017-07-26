@@ -83,6 +83,7 @@
 
 import abc
 import json
+import inspect
 import random
 import datetime
 import logging
@@ -120,12 +121,12 @@ GENDERS = {
 }
 
 
-class BadRequest(BaseException):
-    """Raise if request is bad (400)"""
-
-
 class InvalidRequest(BaseException):
     """Raise if request is invalid (422)"""
+
+
+class InvalidField(BaseException):
+    """Raise if invalid value for field is provided"""
 
 
 class VerifiableField(object):
@@ -133,72 +134,84 @@ class VerifiableField(object):
         self.required = required
         self.nullable = nullable
 
-    def verify(self):
+    def verify(self, value):
         return (
-            (not self.required or self.value is not None) and
-            (not self.nullable or self.value)
+            (not self.required or value is not None) and
+            (self.nullable or value)
         )
 
     def __get__(self, obj, objtype=None):
         return self.value
 
     def __set__(self, obj, value):
+        if not self.verify(value):
+            raise InvalidField()
         self.value = value
 
 
 class CharField(VerifiableField):
-    def verify(self):
+    def verify(self, value):
+        if value is None:
+            return not self.required
         return (
-            super(CharField, self).verify() and
-            isinstance(self.value, basestring)
+            super(CharField, self).verify(value) and
+            isinstance(value, basestring)
         )
 
 
 class ArgumentsField(VerifiableField):
-    def verify(self):
+    def verify(self, value):
         return (
-            super(ArgumentsField, self).verify() and
-            isinstance(self.value, dict)
+            super(ArgumentsField, self).verify(value) and
+            isinstance(value, dict)
         )
 
 
 class EmailField(CharField):
-    def verify(self):
+    def verify(self, value):
+        if value is None:
+            return not self.required
         return (
-            super(EmailField, self).verify() and
-            (not self.value or '@' in self.value)
+            super(EmailField, self).verify(value) and
+            (not value or '@' in value)
         )
 
 
 class PhoneField(VerifiableField):
-    def verify(self):
+    def verify(self, value):
+        if value is None:
+            return not self.required
         if (
-            super(PhoneField, self).verify() and
-            isinstance(self.value, (basestring, numbers.Number))
+            super(PhoneField, self).verify(value) and
+            isinstance(value, (basestring, numbers.Number))
         ):
-            field = str(self.value)
+            field = str(value)
             return len(field) == 11 and field[0] == '7'
         else:
             return False
 
 
 class DateField(VerifiableField):
-    def verify(self):
-        if not super(DateField, self).verify():
+    def verify(self, value):
+        if not super(DateField, self).verify(value):
             return False
+        if value is None:
+            return not self.required
         try:
-            datetime.datetime.strptime(self.value, 'DD.MM.YYYY')
+            datetime.datetime.strptime(value, '%d.%m.%Y')
             return True
         except ValueError:
             return False
 
 
 class BirthDayField(VerifiableField):
-    def verify(self):
-        if super(BirthDayField, self).verify():
+    def verify(self, value):
+        if super(BirthDayField, self).verify(value):
+            if value is None:
+                return not self.required
             try:
                 parsed_date = datetime.datetime.strptime(
-                    self.value, 'DD.MM.YYYY')
+                    value, '%d.%m.%Y')
                 return (
                     parsed_date + relativedelta(years=70) >=
                     datetime.datetime.today()
@@ -210,16 +223,20 @@ class BirthDayField(VerifiableField):
 
 
 class GenderField(VerifiableField):
-    def verify(self):
-        return super(GenderField, self).verify() and self.value in [0, 1, 2]
+    def verify(self, value):
+        if value is None:
+            return not self.required
+        return (
+            super(GenderField, self).verify(value) and value in [0, 1, 2]
+        )
 
 
 class ClientIDsField(VerifiableField):
-    def verify(self):
+    def verify(self, value):
         return (
-            super(ClientIDsField, self).verify() and
-            isinstance(self.value, (list, tuple)) and
-            all(isinstance(i, numbers.Number) for i in self.value)
+            super(ClientIDsField, self).verify(value) and
+            isinstance(value, (list, tuple)) and
+            all(isinstance(i, numbers.Number) for i in value)
         )
 
 
@@ -233,19 +250,16 @@ class Request(object):
                 ):
                     raise InvalidRequest()
                 else:
-                    setattr(self, name, arguments.get(name))
+                    try:
+                        setattr(self, name, arguments.get(name))
+                    except InvalidField as e:
+                        raise InvalidRequest(
+                            '{} field contains invalid value: {!r}'.format(
+                                name, arguments.get(name))
+                        )
 
     def verify(self):
-        for name, attr in self.__class__.__dict__.iteritems():
-            if (
-                isinstance(attr, VerifiableField) and
-                not attr.verify()
-            ):
-                return False, name
-        # for name, attr in self.__dict__.iteritems():
-        #     if isinstance(attr, VerifiableField) and not attr.verify():
-        #         return False, name
-        return True, None
+        raise NotImplementedError()
 
     def response(self, ctx):
         raise NotImplementedError()
@@ -256,22 +270,18 @@ class ClientsInterestsRequest(Request):
     date = DateField(required=False, nullable=True)
 
     def response(self, ctx):
-        valid, field = self.verify()
-        if not valid:
-            return INVALID_REQUEST, '{} field is invalid'.format(field)
-        else:
-            ctx['nclients'] = len(self.client_ids)
-            interests = {
-                client_id: [
-                    ''.join(
-                        random.choice(string.ascii_letters + string.digits)
-                        for n in xrange(random.randint(3, 10))
-                    )
-                    for _ in xrange(random.randint(3, 10))
-                ]
-                for client_id in self.client_ids
-            }
-            return interests, OK
+        ctx['nclients'] = len(self.client_ids)
+        interests = {
+            client_id: [
+                ''.join(
+                    random.choice(string.ascii_letters + string.digits)
+                    for n in xrange(random.randint(3, 10))
+                )
+                for _ in xrange(random.randint(3, 10))
+            ]
+            for client_id in self.client_ids
+        }
+        return interests, OK
 
 
 class OnlineScoreRequest(Request):
@@ -288,24 +298,12 @@ class OnlineScoreRequest(Request):
 
     def verify(self):
         return (
-            super(OnlineScoreRequest, self).verify() and
             self.phone and self.email or
             self.first_name and self.last_name or
             self.gender is not None and self.birthday
         )
 
     def response(self, ctx):
-        # Контекст
-        # в словарь контекста должна прописываться запись  "has" - список полей,
-        # которые были не пустые для данного запроса
-
-        # Ответ:
-        # в ответ выдается произвольное число, которое больше или равно 0
-        # {"score": <число>}
-        # или если запрос пришел от валидного пользователя admin
-        # {"score": 42}
-        # или если произошла ошибка валидации
-        # {"code": 422, "error": "<сообщение о том какое поле невалидно>"}
         ctx['has'] = [
             name
             for name, attr
@@ -333,9 +331,7 @@ class MethodRequest(Request):
         return self.login == ADMIN_LOGIN
 
     def response(self, ctx):
-        if not self.verify():
-            return ERRORS[INVALID_REQUEST], INVALID_REQUEST
-        elif not check_auth(self):
+        if not check_auth(self):
             return ERRORS[FORBIDDEN], FORBIDDEN
         elif self.method == 'clients_interests':
             return ClientsInterestsRequest(self.arguments).response(ctx)
@@ -357,7 +353,7 @@ def check_auth(request):
 def method_handler(request, ctx):
     try:
         request = MethodRequest(request['body'])
-        return request.response(ctx)
+        response, code = request.response(ctx)
     except InvalidRequest:
         response, code = ERRORS[INVALID_REQUEST], INVALID_REQUEST
     return response, code
